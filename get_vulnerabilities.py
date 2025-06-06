@@ -16,12 +16,15 @@ from urllib.request import urlopen, Request
 
 class PullsCollector:
     MAX_FETCH_RETRY = 3
+    # Fields written to the CSV file.  The previous version of this script used
+    # the pull request API and the field list no longer matched the actual
+    # response from the vulnerability alerts API.  Align the field names with
+    # the data returned by the GraphQL query below.
     fields = [
-        "number",
-        "createdAt",
-        "name",
+        "created_at",
+        "package_name",
         "severity",
-        "vulnerableVersionRange"
+        "vulnerable_version_range",
     ]
 
     def __init__(self, token: str, repo_owner: str, repo_name: str, repo_branch = "master"):
@@ -119,13 +122,20 @@ class PullsCollector:
         return json.dumps({'query': query, 'variables': {'cursor': self.cursor}}).encode('utf-8')
 
     def _format(self, vuln: dict) -> dict:
+        """Convert a vulnerability alert node to a flat dictionary.
+
+        The previous implementation expected pull request fields and raised
+        ``KeyError`` for the actual vulnerability alert response.  Each alert
+        contains ``createdAt`` and a ``securityVulnerability`` object with the
+        affected package, the severity and the vulnerable version range.
+        """
+
+        sec = vuln["securityVulnerability"]
         return {
-            "commit_len": vuln['commits']['totalCount'],
-            "base_commit_sha": vuln['baseRefOid'],
-            "merge_commit_sha": vuln['headRefOid'],
-            "created_at": self._parse_datetime(vuln['createdAt']),
-            "merged_at": self._parse_datetime(vuln['mergedAt']),
-            "merged_by": self._merged_by(vuln)
+            "created_at": self._parse_datetime(vuln["createdAt"]),
+            "package_name": sec["package"]["name"],
+            "severity": sec["severity"],
+            "vulnerable_version_range": sec["vulnerableVersionRange"],
         }
 
     def _parse_datetime(self, d: str) -> datetime:
