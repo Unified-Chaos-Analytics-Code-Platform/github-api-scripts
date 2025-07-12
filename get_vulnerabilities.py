@@ -4,31 +4,29 @@
 
 
 import json
-import sys
 from csv import DictWriter
 from datetime import datetime, timezone
 from time import sleep
-from typing import Generator, Optional
-from requests import exceptions, request, post
-from urllib.error import HTTPError
-from urllib.request import urlopen, Request
+from typing import Generator
+from requests import exceptions, post
 
 
 class PullsCollector:
     MAX_FETCH_RETRY = 3
+    # Fields written to the CSV file.  The previous version of this script used
+    # the pull request API and the field list no longer matched the actual
+    # response from the vulnerability alerts API.  Align the field names with
+    # the data returned by the GraphQL query below.
     fields = [
-        "number",
-        "createdAt",
-        "name",
+        "created_at",
+        "package_name",
         "severity",
-        "vulnerableVersionRange"
+        "vulnerable_version_range",
     ]
 
-    def __init__(self, token: str, repo_owner: str, repo_name: str, repo_branch = "master"):
-        self._token = token
+    def __init__(self, token: str, repo_owner: str, repo_name: str):
         self._repo_owner = repo_owner
         self._repo_name = repo_name
-        self._repo_branch = repo_branch
         self._headers = {"Authorization": f"token {token}"}
         self.cursor = None
 
@@ -38,7 +36,7 @@ class PullsCollector:
             writer.writeheader()
             for row in self.all():
                 writer.writerow(row)
-            print("\nFinish to collect the vulnerablity list. Output is " + output_path)
+            print("\nFinish to collect the vulnerability list. Output is " + output_path)
 
     def all(self) -> Generator:
         self.cursor = None
@@ -49,14 +47,17 @@ class PullsCollector:
             if "errors" in obj:
               continue
 
-            for pull in (edge['node'] for edge in obj['data']['repository']['vulnerabilityAlerts']['edges']):
-                yield self._format(pull)
+            for alert in (edge['node'] for edge in obj['data']['repository']['vulnerabilityAlerts']['edges']):
+                yield self._format(alert)
             hasNextPage = obj['data']['repository']['vulnerabilityAlerts']['pageInfo']['hasNextPage']
             self.cursor = obj['data']['repository']['vulnerabilityAlerts']['pageInfo']['endCursor']
             if obj['data']['rateLimit']['remaining'] < 1:
                 reset_at = self._parse_datetime(obj['data']['rateLimit']['resetAt'])
                 delta = reset_at - datetime.now(timezone.utc)
-                sleep(delta.seconds)
+                # ``timedelta.seconds`` wraps around at 24h and fails for
+                # negative values.  ``total_seconds`` handles both cases so we
+                # wait the correct amount of time until the rate limit resets.
+                sleep(max(delta.total_seconds(), 0))
 
     def _generator(self):
         nth_retry = 0
@@ -83,9 +84,10 @@ class PullsCollector:
                 raise err
 
     def _graphql_request(self) -> str:
-        """GitHub GraphQL Query
+        """GitHub GraphQL Query for vulnerability alerts.
 
-        See https://developer.github.com/v4/object/pullrequest/
+        The original version referenced pull requests, but this query fetches
+        vulnerability alerts and associated security vulnerability details.
         """
         query = '''
             query($cursor: String) {
@@ -114,31 +116,39 @@ class PullsCollector:
                 }
               }
             }
-        ''' % {'repo_owner': self._repo_owner, 'repo_name': self._repo_name, 'repo_branch': self._repo_branch}
+        ''' % {'repo_owner': self._repo_owner, 'repo_name': self._repo_name}
         # return query
         return json.dumps({'query': query, 'variables': {'cursor': self.cursor}}).encode('utf-8')
 
     def _format(self, vuln: dict) -> dict:
+        """Convert a vulnerability alert node to a flat dictionary.
+
+        The previous implementation expected pull request fields and raised
+        ``KeyError`` for the actual vulnerability alert response.  Each alert
+        contains ``createdAt`` and a ``securityVulnerability`` object with the
+        affected package, the severity and the vulnerable version range.
+        """
+
+        sec = vuln["securityVulnerability"]
         return {
-            "commit_len": vuln['commits']['totalCount'],
-            "base_commit_sha": vuln['baseRefOid'],
-            "merge_commit_sha": vuln['headRefOid'],
-            "created_at": self._parse_datetime(vuln['createdAt']),
-            "merged_at": self._parse_datetime(vuln['mergedAt']),
-            "merged_by": self._merged_by(vuln)
+            "created_at": self._parse_datetime(vuln["createdAt"]),
+            "package_name": sec["package"]["name"],
+            "severity": sec["severity"],
+            "vulnerable_version_range": sec["vulnerableVersionRange"],
         }
 
     def _parse_datetime(self, d: str) -> datetime:
-        return datetime.strptime(d, '%Y-%m-%dT%H:%M:%SZ')
+        """Return a timezone-aware datetime parsed from an ISO 8601 string."""
+        return datetime.strptime(d, '%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=timezone.utc)
 
-    def _merged_by(self, vuln: dict) -> Optional[str]:
-        merged_by = vuln.get('mergedBy')
-        if merged_by is None:
-            return None
-        return merged_by.get('login')
 
 if __name__ == "__main__":
-    collector = PullsCollector("995a00abc096ec3203f1fe85b134bf8d2d0c9574", "kubernetes", "kubernetes")
-    for x in collector.all():
-      # if x["created_at"] > datetime.strptime("2019-1-1", '%Y-%m-%d'):
-      print(x)
+    import os
+
+    token = os.getenv("GITHUB_TOKEN")
+    if not token:
+        raise SystemExit("Set the GITHUB_TOKEN environment variable")
+
+    collector = PullsCollector(token, "kubernetes", "kubernetes")
+    for alert in collector.all():
+        print(alert)
